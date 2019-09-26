@@ -1,0 +1,33 @@
+version: '3.4'
+
+networks:
+  api:
+    external:
+      name: api.reaction.localhost
+  auth.reaction.localhost:
+    external:
+      name: auth.reaction.localhost
+
+services:
+  web:
+    build:
+      context: .
+      dockerfile: 'Dockerfile.dev'
+    env_file:
+      - ./.env
+    networks:
+      api:
+        aliases:
+          - storefront
+      auth.reaction.localhost:
+    ports:
+      - 4000:4000
+    volumes:
+      - $HOME/.cache/yarn-offline-mirror:/home/node/.cache/yarn-offline-mirror
+      - web-yarn:/home/node/.cache/yarn
+      - .:/usr/local/src/reaction-app
+      - node_modules:/usr/local/src/node_modules
+
+volumes:
+  web-yarn:
+  node_modules:

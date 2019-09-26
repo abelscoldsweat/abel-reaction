@@ -1,0 +1,260 @@
+# This CircleCI configuration uses workflows to fan-out to multiple jobs.  The
+# workflow is Dockerized. The first job builds the Docker image which is used
+# in all future steps.
+#
+#  Assumes that the Docker image is published to Docker Hub.
+version: 2
+
+# The following stanza defines a map named defaults with a variable that may be
+# inserted using the YAML merge (<<: *) key later in the file to save some
+# typing. See http://yaml.org/type/merge.html for details.
+defaults: &defaults
+  environment:
+    - DOCKER_REPOSITORY: "reactioncommerce/reaction-next-starterkit"
+#    - DOCKER_REPOSITORY: "202687395681.dkr.ecr.us-west-2.amazonaws.com/reactioncommerce/reaction-next-starterkit"
+    - DOCKER_NAMESPACE: "reactioncommerce"
+    - DOCKER_NAME: "reaction-next-starterkit"
+    - GLOBAL_CACHE_VERSION: “v3”
+
+  docker:
+    - image: circleci/node:10-stretch
+
+jobs:
+  docker-build:
+    <<: *defaults
+    steps:
+      - checkout
+      - setup_remote_docker
+      - run:
+          name: Discover Docker Tags
+          command: |
+            (cd /tmp && npm install --no-progress @reactioncommerce/ci-scripts@1.4.0 >/dev/null)
+            mkdir -p docker-cache
+            /tmp/node_modules/.bin/docker-tags "$CIRCLE_SHA1" "$CIRCLE_BRANCH" \
+              | tee docker-cache/docker-tags.txt
+      - run:
+          name: Docker Build
+          command: |
+            (cd /tmp && npm install --no-progress @reactioncommerce/ci-scripts@1.4.0 >/dev/null)
+            /tmp/node_modules/.bin/docker-labels >> Dockerfile
+            docker build --tag "$DOCKER_REPOSITORY:$CIRCLE_SHA1" .
+            mkdir -p docker-cache
+            docker save \
+              -o docker-cache/docker-image.tar \
+              "$DOCKER_REPOSITORY:$CIRCLE_SHA1"
+      - persist_to_workspace:
+          root: docker-cache
+          paths:
+            - docker-image.tar
+            - docker-tags.txt
+  docker-push:
+    <<: *defaults
+    steps:
+      - setup_remote_docker
+      - attach_workspace:
+          at: docker-cache
+      - run:
+          name: Load and Tag Docker Image
+          command: |
+            docker load < docker-cache/docker-image.tar
+            cat docker-cache/docker-tags.txt \
+              | xargs -t -I % \
+                docker tag \
+                  "$DOCKER_REPOSITORY:$CIRCLE_SHA1" \
+                  "$DOCKER_REPOSITORY:%"
+      - run:
+          # Creates a new Docker repository. This is not strictly required if
+          # the Docker Hub defaults are set appropriately.
+          name: Create Private Docker Hub Repository
+          command: |
+            # Fetch a login token from environment credentials.
+            TOKEN=$(curl \
+              -H "Content-Type: application/json" \
+              -X POST  \
+              -d "{\"username\":\"$DOCKER_USER\",\"password\":\"$DOCKER_PASS\"}" \
+              -s \
+              https://hub.docker.com/v2/users/login/ \
+                | jq -r .token)
+            # Try to create the private repo. It exits with success on fail.
+            curl \
+             -H "Authorization: JWT $TOKEN" \
+             -H "Content-Type: application/json" \
+             -d "{\"namespace\":\"$DOCKER_NAMESPACE\",
+                  \"name\":\"$DOCKER_NAME\",
+                  \"description\":\"$DESCRIPTION\",
+                  \"full_description\":\"\",
+                  \"is_private\":true}" \
+            https://hub.docker.com/v2/repositories/
+      - run:
+          name: Docker Push
+          command: |
+            docker login -u "$DOCKER_USER" -p "$DOCKER_PASS"
+            docker push "$DOCKER_REPOSITORY:$CIRCLE_SHA1"
+            cat docker-cache/docker-tags.txt \
+                | xargs -t -I % \
+                docker push "$DOCKER_REPOSITORY:%"
+
+  deploy-to-ecs:
+    <<: *defaults
+    steps:
+      - checkout
+      - run:
+          name: Deploy new task definition and update service in ECS
+          command: |
+            .circleci/bin/ecs-deploy.sh
+
+  lint-javascript:
+    <<: *defaults
+    steps:
+      - checkout
+      - run:
+          name: Lint JavaScript
+          command: |
+            yarn install
+            yarn lint
+
+  test:
+    <<: *defaults
+    steps:
+      - checkout
+      - setup_remote_docker
+      - attach_workspace:
+          at: docker-cache
+      - run:
+          name: Load and Tag Docker Image
+          command: |
+            docker load < docker-cache/docker-image.tar
+            cat docker-cache/docker-tags.txt \
+              | xargs -t -I % \
+                docker tag \
+                  "$DOCKER_REPOSITORY:$CIRCLE_SHA1" \
+                  "$DOCKER_REPOSITORY:%"
+      - run:
+          name: Test
+          command: |
+            docker run \
+              --env-file .env.example \
+              --env NODE_ENV=test \
+              --name reactionapp_next_starterkit \
+              "$DOCKER_REPOSITORY:$CIRCLE_SHA1" \
+              yarn test:ci
+      - run:
+          name: Copy test artifacts from Remote Docker
+          command: |
+            docker cp \
+              reactionapp_next_starterkit:/usr/local/src/reaction-app/reports \
+              reports
+      - store_test_results:
+          path: reports/junit
+      - store_artifacts:
+          path: reports
+
+  e2e-test:
+    <<: *defaults
+    steps:
+      - checkout
+      - setup_remote_docker
+      - attach_workspace:
+          at: docker-cache
+      - run:
+          name: Load Docker Image
+          command: |
+            docker load < docker-cache/docker-image.tar
+      - run:
+          name: Integration Test
+          command: |
+            docker run -e URL=${STAGING_URL} --env-file .env.example --name reaction_app_next_starterkit "$DOCKER_REPOSITORY:$CIRCLE_SHA1" yarn run test:integration
+      - run:
+          name: Install Broken Link Checker
+          command: |
+            yarn add broken-link-checker
+      - run:
+          name: Broken Link Test
+          command: |
+            ./node_modules/.bin/blc ${STAGING_URL} -ro -filter=3 -e
+
+  test-metrics:
+    <<: *defaults
+    steps:
+      - checkout
+      - run:
+          name: California
+          command: |
+            .circleci/bin/calibre-deploy.sh ${STAGING_URL} California
+      - run:
+          name: North Virginia
+          command: |
+            .circleci/bin/calibre-deploy.sh ${STAGING_URL} NorthVirginia
+      - run:
+          name: London
+          command: |
+            .circleci/bin/calibre-deploy.sh ${STAGING_URL} London
+      - run:
+          name: Frankfurt
+          command: |
+            .circleci/bin/calibre-deploy.sh ${STAGING_URL} Frankfurt
+
+  snyk-security:
+    <<: *defaults
+    steps:
+      - checkout
+      - setup_remote_docker
+      - attach_workspace:
+          at: docker-cache
+      - run:
+          name: Load Docker Image
+          command: |
+            docker load < docker-cache/docker-image.tar
+      - run:
+          name: Snyk Security
+          # Snyk doesn't look up the directory tree for node_modules as
+          # NodeJS does so we have to take some extra measures to test in the
+          # Docker image. Copy package.json up a directory so that it is a
+          # sibling to node_modules, then run snyk test.
+          command: |
+            answer=$(./.circleci/bin/should-run-snyk.sh)
+            if [[ "${answer}" =~ "^YES" ]] ; then
+              docker run \
+                --env-file .env.example \
+                --env "SNYK_TOKEN" \
+                --name reactionapp_next_starterkit \
+                --workdir /usr/local/src \
+                "$DOCKER_REPOSITORY:$CIRCLE_SHA1" \
+                sh -c "cp reaction-app/package.json ./ && cp reaction-app/.snyk ./ && snyk test"
+            else
+              echo "Skipping snyk: ${answer}"
+            fi
+workflows:
+  version: 2
+  build_and_test:
+    jobs:
+      - lint-javascript:
+          context: reaction-build-read
+      - docker-build:
+          context: reaction-build-read
+          requires:
+            - lint-javascript
+      - docker-push:
+          context: reaction-publish-docker
+          requires:
+            - docker-build
+      - test:
+          context: reaction-validation
+          requires:
+            - docker-build
+      - test-metrics:
+          requires:
+            - deploy-to-ecs
+      - snyk-security:
+          context: reaction-validation
+          requires:
+            - docker-build
+      - deploy-to-ecs:
+          requires:
+            - docker-push
+          filters:
+            branches:
+              only: /^develop$/
+      - e2e-test:
+          requires:
+            - deploy-to-ecs
